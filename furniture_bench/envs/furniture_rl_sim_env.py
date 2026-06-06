@@ -2104,6 +2104,12 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             dtype=torch.bool,
             device=self.device,
         )
+        self.last_desk_leg_rot_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_assembly_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
         self.consecutive_assembled_steps = torch.zeros(
             (self.num_envs, len(self.pairs_to_assemble)),
             dtype=torch.int32,
@@ -2458,7 +2464,10 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             self.already_assembled[:, i] |= newly_assembled_mask[:, i]
 
         # Compute the rewards based on the newly assembled parts
-        rewards = newly_assembled_mask.any(dim=1).float().unsqueeze(-1)
+        assembly_rewards = newly_assembled_mask.any(dim=1).float().unsqueeze(-1)
+        rewards = assembly_rewards
+        self.last_assembly_rewards = assembly_rewards
+        self.last_desk_leg_rot_rewards = desk_leg_rot_rewards.unsqueeze(-1)
         rewards = rewards + desk_leg_rot_rewards.unsqueeze(-1)
 
         # print(f"Already assembled: {self.already_assembled.sum(dim=1)}")
@@ -2506,11 +2515,18 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
                 self.max_torque_magnitude,
             )
 
+        info = {
+            "obs_success": True,
+            "action_success": True,
+            "assembly_reward": self.last_assembly_rewards.clone(),
+            "desk_leg_rot_reward": self.last_desk_leg_rot_rewards.clone(),
+        }
+
         return (
             obs,
             reward,
             done,
-            {"obs_success": True, "action_success": True},
+            info,
         )
 
     def _reset_frankas(self, env_idxs: torch.Tensor):
