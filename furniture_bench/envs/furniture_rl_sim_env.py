@@ -2186,7 +2186,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         current_rot_error = inserted_rot_errors.min(dim=0).values
         inserted_now = torch.isfinite(current_rot_error)
-        track_now = inserted_now & ~self.already_assembled[:, pair_idx]
+        assembled_pair = self.already_assembled[:, pair_idx]
+        pre_assembly_track_now = inserted_now & ~assembled_pair
+        post_assembly_track_now = inserted_now & assembled_pair
 
         prev_rot_error = self.desk_leg_prev_rot_error[:, pair_idx]
         valid_prev = torch.isfinite(prev_rot_error)
@@ -2197,13 +2199,18 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             self.desk_leg_rot_reward_clip,
         )
         rot_reward = torch.where(
-            track_now & valid_prev,
+            pre_assembly_track_now & valid_prev,
             rot_error_delta * self.desk_leg_rot_reward_weight,
             torch.zeros_like(rot_error_delta),
         )
+        rot_reward = torch.where(
+            post_assembly_track_now & valid_prev,
+            -torch.abs(rot_error_delta) * self.desk_leg_rot_reward_weight,
+            rot_reward,
+        )
 
         self.desk_leg_prev_rot_error[:, pair_idx] = torch.where(
-            track_now,
+            inserted_now,
             current_rot_error,
             torch.full_like(current_rot_error, float("nan")),
         )
