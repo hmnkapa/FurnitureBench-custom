@@ -146,6 +146,12 @@ class FurnitureSimEnv(gym.Env):
         self.desk_leg_rot_reward_clip = float(
             kwargs.get("desk_leg_rot_reward_clip", 0.2)
         )
+        self.desk_leg_insert_reward_value = float(
+            kwargs.get(
+                "desk_leg_insert_reward_value",
+                kwargs.get("desk_leg_insert_reward", 1.0),
+            )
+        )
 
         self.max_env_steps = max_env_steps
         self.furniture.max_env_steps = max_env_steps
@@ -1535,10 +1541,9 @@ class FurnitureSimEnv(gym.Env):
         if reset_parts:
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(
-                torch.tensor([env_idx], device=self.device, dtype=torch.int32)
-            )
+        self._reset_reward_bookkeeping(
+            torch.tensor([env_idx], device=self.device, dtype=torch.int32)
+        )
         self.move_neutral = False
 
     def reset_to(self, state):
@@ -1550,21 +1555,23 @@ class FurnitureSimEnv(gym.Env):
         for i in range(self.num_envs):
             self.reset_env_to(i, state[i])
 
-        if (
-            hasattr(self, "already_assembled")
-            or hasattr(self, "consecutive_assembled_steps")
-            or getattr(self, "furniture_name", None) == "lamp"
-        ):
+        reward_state_attrs = (
+            "already_assembled",
+            "already_inserted",
+            "consecutive_assembled_steps",
+            "consecutive_inserted_steps",
+            "desk_leg_prev_rot_error",
+        )
+        env_idxs = None
+        if any(hasattr(self, attr) for attr in reward_state_attrs) or getattr(
+            self, "furniture_name", None
+        ) == "lamp":
             env_idxs = torch.arange(
                 self.num_envs, device=self.device, dtype=torch.int32
             )
 
-        if hasattr(self, "already_assembled"):
-            self.already_assembled[env_idxs] = 0
-        if hasattr(self, "consecutive_assembled_steps"):
-            self.consecutive_assembled_steps[env_idxs] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(env_idxs)
+        if env_idxs is not None:
+            self._reset_reward_bookkeeping(env_idxs)
 
         if getattr(self, "furniture_name", None) == "lamp" and hasattr(
             self, "_reset_lamp_bulb_state"
@@ -1596,10 +1603,9 @@ class FurnitureSimEnv(gym.Env):
         self._reset_franka(env_idx, dof_pos)
         self._reset_parts(env_idx, state["parts_poses"])
         self.env_steps[env_idx] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(
-                torch.tensor([env_idx], device=self.device, dtype=torch.int32)
-            )
+        self._reset_reward_bookkeeping(
+            torch.tensor([env_idx], device=self.device, dtype=torch.int32)
+        )
         self.move_neutral = False
 
     def _update_franka_dof_state_buffer(self, dof_pos=None):
@@ -2104,13 +2110,26 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             dtype=torch.bool,
             device=self.device,
         )
+        self.already_inserted = torch.zeros(
+            (self.num_envs, len(self.pairs_to_assemble)),
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.last_desk_leg_rot_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
         self.last_assembly_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
+        self.last_insert_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
         self.consecutive_assembled_steps = torch.zeros(
+            (self.num_envs, len(self.pairs_to_assemble)),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.consecutive_inserted_steps = torch.zeros(
             (self.num_envs, len(self.pairs_to_assemble)),
             dtype=torch.int32,
             device=self.device,
@@ -2160,6 +2179,23 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         if hasattr(self, "desk_leg_prev_rot_error"):
             self.desk_leg_prev_rot_error[env_idxs] = float("nan")
 
+    def _reset_reward_bookkeeping(self, env_idxs: torch.Tensor):
+        if hasattr(self, "already_assembled"):
+            self.already_assembled[env_idxs] = 0
+        if hasattr(self, "already_inserted"):
+            self.already_inserted[env_idxs] = 0
+        if hasattr(self, "consecutive_assembled_steps"):
+            self.consecutive_assembled_steps[env_idxs] = 0
+        if hasattr(self, "consecutive_inserted_steps"):
+            self.consecutive_inserted_steps[env_idxs] = 0
+        if hasattr(self, "last_assembly_rewards"):
+            self.last_assembly_rewards[env_idxs] = 0
+        if hasattr(self, "last_insert_rewards"):
+            self.last_insert_rewards[env_idxs] = 0
+        if hasattr(self, "last_desk_leg_rot_rewards"):
+            self.last_desk_leg_rot_rewards[env_idxs] = 0
+        self._reset_desk_leg_rotation_reward(env_idxs)
+
     def _compute_desk_leg_rotation_reward(
         self,
         pair_idx: int,
@@ -2186,7 +2222,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         current_rot_error = inserted_rot_errors.min(dim=0).values
         inserted_now = torch.isfinite(current_rot_error)
-        track_now = inserted_now & ~self.already_assembled[:, pair_idx]
+        assembled_pair = self.already_assembled[:, pair_idx]
+        pre_assembly_track_now = inserted_now & ~assembled_pair
+        post_assembly_track_now = inserted_now & assembled_pair
 
         prev_rot_error = self.desk_leg_prev_rot_error[:, pair_idx]
         valid_prev = torch.isfinite(prev_rot_error)
@@ -2197,13 +2235,18 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             self.desk_leg_rot_reward_clip,
         )
         rot_reward = torch.where(
-            track_now & valid_prev,
+            pre_assembly_track_now & valid_prev,
             rot_error_delta * self.desk_leg_rot_reward_weight,
             torch.zeros_like(rot_error_delta),
         )
+        rot_reward = torch.where(
+            post_assembly_track_now & valid_prev,
+            -torch.abs(rot_error_delta) * self.desk_leg_rot_reward_weight,
+            rot_reward,
+        )
 
         self.desk_leg_prev_rot_error[:, pair_idx] = torch.where(
-            track_now,
+            inserted_now,
             current_rot_error,
             torch.full_like(current_rot_error, float("nan")),
         )
@@ -2337,9 +2380,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
 
         assert env_idxs.numel() > 0
 
-        self.already_assembled[env_idxs] = 0
-        self.consecutive_assembled_steps[env_idxs] = 0
-        self._reset_desk_leg_rotation_reward(env_idxs)
+        self._reset_reward_bookkeeping(env_idxs)
         self._reset_frankas(env_idxs)
         self._reset_parts_multiple(env_idxs)
         self.env_steps[env_idxs] = 0
@@ -2381,6 +2422,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         desk_leg_rot_rewards = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
+        insert_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
 
         parts_poses = self.get_parts_poses(sim_coord=True)
 
@@ -2390,6 +2434,11 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
 
         # Compute the rewards based on the newly assembled parts
         newly_assembled_mask = torch.zeros(
+            (self.num_envs, len(self.pairs_to_assemble)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        newly_inserted_mask = torch.zeros(
             (self.num_envs, len(self.pairs_to_assemble)),
             dtype=torch.bool,
             device=self.device,
@@ -2427,6 +2476,20 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
                 self.assembled_rel_poses[i, :, None, :3, 3],
                 pos_threshold,
             )
+            track_insert_reward = self.furniture_name == "desk" and pair[0] == 0
+            if track_insert_reward:
+                inserted_now = similar_pos.any(dim=0)
+                self.consecutive_inserted_steps[:, i] = torch.where(
+                    inserted_now,
+                    self.consecutive_inserted_steps[:, i] + 1,
+                    torch.zeros_like(self.consecutive_inserted_steps[:, i]),
+                )
+                newly_inserted_mask[:, i] = (
+                    (self.consecutive_inserted_steps[:, i] >= self.assembly_confirm_frames)
+                    & ~self.already_inserted[:, i]
+                )
+                self.already_inserted[:, i] |= newly_inserted_mask[:, i]
+
             desk_leg_rot_rewards += self._compute_desk_leg_rotation_reward(
                 i,
                 pair,
@@ -2464,8 +2527,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             self.already_assembled[:, i] |= newly_assembled_mask[:, i]
 
         # Compute the rewards based on the newly assembled parts
+        insert_rewards = (
+            newly_inserted_mask.any(dim=1).float().unsqueeze(-1)
+            * self.desk_leg_insert_reward_value
+        )
         assembly_rewards = newly_assembled_mask.any(dim=1).float().unsqueeze(-1)
-        rewards = assembly_rewards
+        rewards = insert_rewards + assembly_rewards
+        self.last_insert_rewards = insert_rewards
         self.last_assembly_rewards = assembly_rewards
         self.last_desk_leg_rot_rewards = desk_leg_rot_rewards.unsqueeze(-1)
         rewards = rewards + desk_leg_rot_rewards.unsqueeze(-1)
@@ -2475,7 +2543,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         #     f"Done envs: {torch.where(self.already_assembled.sum(dim=1) == len(self.pairs_to_assemble))[0]}"
         # )
 
-        if self.manual_done and (rewards == 1).any():
+        if self.manual_done and (assembly_rewards == 1).any():
             return print("Part assembled!")
 
         return rewards
@@ -2518,6 +2586,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         info = {
             "obs_success": True,
             "action_success": True,
+            "insert_reward": self.last_insert_rewards.clone(),
             "assembly_reward": self.last_assembly_rewards.clone(),
             "desk_leg_rot_reward": self.last_desk_leg_rot_rewards.clone(),
         }
