@@ -137,14 +137,45 @@ class FurnitureSimEnv(gym.Env):
         self.furniture.assembly_debug = self.assembly_debug
         for furn in self.furnitures:
             furn.assembly_debug = self.assembly_debug
-        self.desk_leg_rot_reward_enabled = furniture == "desk" and bool(
-            kwargs.get("desk_leg_rot_reward", True)
+        self.desk_insert_reward_value = float(kwargs.get("desk_insert_reward", 0.5))
+        self.desk_success_reward_value = float(kwargs.get("desk_success_reward", 1.0))
+        self.desk_twist_target_rad = float(
+            np.deg2rad(kwargs.get("desk_twist_target_deg", 520.0))
         )
-        self.desk_leg_rot_reward_weight = float(
-            kwargs.get("desk_leg_rot_reward_weight", 0.1)
+        self.desk_twist_round_rad = float(
+            np.deg2rad(kwargs.get("desk_twist_round_deg", 90.0))
         )
-        self.desk_leg_rot_reward_clip = float(
-            kwargs.get("desk_leg_rot_reward_clip", 0.2)
+        self.desk_twist_total_reward = float(
+            kwargs.get("desk_twist_total_reward", 1.0)
+        )
+        self.desk_twist_axis_sign = float(kwargs.get("desk_twist_axis_sign", 1.0))
+        self.desk_contact_reward_weight = float(
+            kwargs.get("desk_contact_reward_weight", 0.15)
+        )
+        self.desk_release_reward_weight = float(
+            kwargs.get("desk_release_reward_weight", 0.10)
+        )
+        self.desk_contact_reward_scale = float(
+            kwargs.get("desk_contact_reward_scale", 0.02)
+        )
+        self.desk_contact_threshold = float(kwargs.get("desk_contact_threshold", 0.035))
+        self.desk_release_contact_threshold = float(
+            kwargs.get("desk_release_contact_threshold", 0.045)
+        )
+        self.desk_contact_key_y = float(kwargs.get("desk_contact_key_y", 0.03375))
+        self.desk_contact_surface = float(kwargs.get("desk_contact_surface", 0.0175))
+        self.desk_twist_delta_clip_rad = float(
+            np.deg2rad(kwargs.get("desk_twist_delta_clip_deg", 20.0))
+        )
+        self.desk_twist_progress_threshold_rad = float(
+            np.deg2rad(kwargs.get("desk_twist_progress_threshold_deg", 2.0))
+        )
+        self.desk_no_progress_limit = int(kwargs.get("desk_no_progress_limit", 15))
+        self.desk_wrist_limit_margin_rad = float(
+            kwargs.get("desk_wrist_limit_margin_rad", 0.20)
+        )
+        self.desk_wrist_reset_threshold_rad = float(
+            kwargs.get("desk_wrist_reset_threshold_rad", 0.35)
         )
 
         self.max_env_steps = max_env_steps
@@ -468,6 +499,16 @@ class FurnitureSimEnv(gym.Env):
             franka_dof_props["damping"][7:].fill(0)
             franka_dof_props["friction"][7:] = sim_config["robot"]["gripper_frictions"]
             franka_dof_props["upper"][7:] = self.max_gripper_width / 2
+            self.franka_dof_lower_limits = torch.tensor(
+                franka_dof_props["lower"][:7],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self.franka_dof_upper_limits = torch.tensor(
+                franka_dof_props["upper"][:7],
+                device=self.device,
+                dtype=torch.float32,
+            )
 
             self.isaac_gym.set_actor_dof_properties(
                 env, franka_handle, franka_dof_props
@@ -1535,8 +1576,8 @@ class FurnitureSimEnv(gym.Env):
         if reset_parts:
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(
+        if getattr(self, "furniture_name", None) == "desk":
+            self._reset_desk_reward_state(
                 torch.tensor([env_idx], device=self.device, dtype=torch.int32)
             )
         self.move_neutral = False
@@ -1563,8 +1604,8 @@ class FurnitureSimEnv(gym.Env):
             self.already_assembled[env_idxs] = 0
         if hasattr(self, "consecutive_assembled_steps"):
             self.consecutive_assembled_steps[env_idxs] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(env_idxs)
+        if getattr(self, "furniture_name", None) == "desk":
+            self._reset_desk_reward_state(env_idxs)
 
         if getattr(self, "furniture_name", None) == "lamp" and hasattr(
             self, "_reset_lamp_bulb_state"
@@ -1596,8 +1637,8 @@ class FurnitureSimEnv(gym.Env):
         self._reset_franka(env_idx, dof_pos)
         self._reset_parts(env_idx, state["parts_poses"])
         self.env_steps[env_idx] = 0
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self._reset_desk_leg_rotation_reward(
+        if getattr(self, "furniture_name", None) == "desk":
+            self._reset_desk_reward_state(
                 torch.tensor([env_idx], device=self.device, dtype=torch.int32)
             )
         self.move_neutral = False
@@ -2104,8 +2145,26 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             dtype=torch.bool,
             device=self.device,
         )
-        self.last_desk_leg_rot_rewards = torch.zeros(
+        self.last_insert_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_twist_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_contact_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_release_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_success_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_desk_phase = torch.zeros(
+            (self.num_envs, 1), dtype=torch.int64, device=self.device
+        )
+        self.last_desk_contact_dist = torch.full(
+            (self.num_envs, 1), float("inf"), dtype=torch.float32, device=self.device
         )
         self.last_assembly_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
@@ -2116,12 +2175,405 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             device=self.device,
         )
         self.assembly_confirm_frames = 3
-        self.desk_leg_prev_rot_error = torch.full(
-            (self.num_envs, len(self.pairs_to_assemble)),
-            float("nan"),
+        if self.furniture_name == "desk":
+            self._init_desk_reward_state()
+
+    def _init_desk_reward_state(self):
+        self.desk_phase_approach = 0
+        self.desk_phase_twist = 1
+        self.desk_phase_release_reset = 2
+        num_pairs = len(self.pairs_to_assemble)
+
+        self.desk_inserted_mask = torch.zeros(
+            (self.num_envs, num_pairs), dtype=torch.bool, device=self.device
+        )
+        self.desk_success_mask = torch.zeros(
+            (self.num_envs, num_pairs), dtype=torch.bool, device=self.device
+        )
+        self.desk_phase = torch.full(
+            (self.num_envs,),
+            self.desk_phase_approach,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.desk_current_pair_idx = torch.zeros(
+            self.num_envs, dtype=torch.int64, device=self.device
+        )
+        self.desk_prev_leg_rot = torch.eye(
+            3, dtype=torch.float32, device=self.device
+        ).repeat(self.num_envs, num_pairs, 1, 1)
+        self.desk_prev_leg_rot_valid = torch.zeros(
+            (self.num_envs, num_pairs), dtype=torch.bool, device=self.device
+        )
+        self.desk_cumulative_twist = torch.zeros(
+            (self.num_envs, num_pairs), dtype=torch.float32, device=self.device
+        )
+        self.desk_round_twist = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.desk_no_progress_steps = torch.zeros(
+            self.num_envs, dtype=torch.int32, device=self.device
+        )
+        self.desk_prev_contact_dist = torch.full(
+            (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
+        )
+        self.desk_prev_release_dist = torch.full(
+            (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
+        )
+
+        s = self.desk_contact_surface
+        y = self.desk_contact_key_y
+        self.desk_contact_keypoints_local = torch.tensor(
+            [
+                [[s, y, 0.0], [-s, y, 0.0]],
+                [[0.0, y, s], [0.0, y, -s]],
+            ],
             dtype=torch.float32,
             device=self.device,
         )
+
+    def _reset_desk_reward_state(self, env_idxs: torch.Tensor):
+        if self.furniture_name != "desk" or not hasattr(self, "desk_inserted_mask"):
+            return
+
+        env_idxs = env_idxs.to(device=self.device, dtype=torch.long)
+        self.desk_inserted_mask[env_idxs] = False
+        self.desk_success_mask[env_idxs] = False
+        self.already_assembled[env_idxs] = False
+        self.consecutive_assembled_steps[env_idxs] = 0
+        self.desk_phase[env_idxs] = self.desk_phase_approach
+        self.desk_current_pair_idx[env_idxs] = 0
+        self.desk_prev_leg_rot[env_idxs] = torch.eye(
+            3, dtype=torch.float32, device=self.device
+        )
+        self.desk_prev_leg_rot_valid[env_idxs] = False
+        self.desk_cumulative_twist[env_idxs] = 0.0
+        self.desk_round_twist[env_idxs] = 0.0
+        self.desk_no_progress_steps[env_idxs] = 0
+        self.desk_prev_contact_dist[env_idxs] = float("nan")
+        self.desk_prev_release_dist[env_idxs] = float("nan")
+        self.last_insert_rewards[env_idxs] = 0.0
+        self.last_twist_rewards[env_idxs] = 0.0
+        self.last_contact_rewards[env_idxs] = 0.0
+        self.last_release_rewards[env_idxs] = 0.0
+        self.last_success_rewards[env_idxs] = 0.0
+        self.last_desk_phase[env_idxs] = self.desk_phase_approach
+        self.last_desk_contact_dist[env_idxs] = float("inf")
+        self.last_assembly_rewards[env_idxs] = 0.0
+
+    def _desk_leg_pose_mats(self, parts_poses: torch.Tensor):
+        leg_pose_mats = []
+        for _, leg_idx in self.pairs_to_assemble:
+            leg_pose_mats.append(C.pose_from_vector(parts_poses[:, leg_idx]))
+        return torch.stack(leg_pose_mats, dim=1)
+
+    def _desk_inserted_now(self, parts_poses: torch.Tensor) -> torch.Tensor:
+        inserted_now = torch.zeros(
+            (self.num_envs, len(self.pairs_to_assemble)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        pos_threshold = torch.tensor(
+            self.furniture.assembled_pos_threshold,
+            device=self.device,
+            dtype=parts_poses.dtype,
+        )
+
+        for i, pair in enumerate(self.pairs_to_assemble):
+            pose_mat1 = C.pose_from_vector(parts_poses[:, pair[0]])
+            pose_mat2 = C.pose_from_vector(parts_poses[:, pair[1]])
+            rel_pose = torch.matmul(torch.inverse(pose_mat1), pose_mat2)
+            similar_pos = C.is_similar_pos(
+                rel_pose[..., :3, 3],
+                self.assembled_rel_poses[i, :, None, :3, 3],
+                pos_threshold,
+            )
+            inserted_now[:, i] = similar_pos.any(dim=0)
+
+        return inserted_now
+
+    def _desk_contact_distances(self, leg_pose_mats: torch.Tensor) -> torch.Tensor:
+        leg_pos = leg_pose_mats[..., :3, 3]
+        leg_rot = leg_pose_mats[..., :3, :3]
+        local_points = self.desk_contact_keypoints_local
+        world_points = (
+            torch.einsum("elij,kpj->elkpi", leg_rot, local_points)
+            + leg_pos[:, :, None, None, :]
+        )
+
+        left = self.rb_states[self.left_finger_idxs, :3]
+        right = self.rb_states[self.right_finger_idxs, :3]
+        left_dist = torch.linalg.norm(
+            left[:, None, None, :] - world_points[:, :, :, 0], dim=-1
+        )
+        right_dist = torch.linalg.norm(
+            right[:, None, None, :] - world_points[:, :, :, 1], dim=-1
+        )
+        swapped_left_dist = torch.linalg.norm(
+            left[:, None, None, :] - world_points[:, :, :, 1], dim=-1
+        )
+        swapped_right_dist = torch.linalg.norm(
+            right[:, None, None, :] - world_points[:, :, :, 0], dim=-1
+        )
+        direct = left_dist + right_dist
+        swapped = swapped_left_dist + swapped_right_dist
+        return torch.minimum(direct, swapped).min(dim=-1).values
+
+    def _desk_select_current_pairs(self, contact_dists: torch.Tensor):
+        unfinished = ~self.desk_success_mask
+        has_unfinished = unfinished.any(dim=1)
+        masked_dists = torch.where(
+            unfinished,
+            contact_dists,
+            torch.full_like(contact_dists, float("inf")),
+        )
+        closest_pair = masked_dists.argmin(dim=1)
+        should_select = (self.desk_phase == self.desk_phase_approach) & has_unfinished
+        self.desk_current_pair_idx = torch.where(
+            should_select, closest_pair, self.desk_current_pair_idx
+        )
+
+    def _desk_wrist_near_limit(self) -> torch.Tensor:
+        if not hasattr(self, "franka_dof_lower_limits") or not hasattr(
+            self, "franka_dof_upper_limits"
+        ):
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        wrist_pos = self.dof_pos[:, 6]
+        lower_margin = wrist_pos - self.franka_dof_lower_limits[6]
+        upper_margin = self.franka_dof_upper_limits[6] - wrist_pos
+        return (
+            torch.minimum(lower_margin, upper_margin)
+            < self.desk_wrist_limit_margin_rad
+        )
+
+    def _desk_release_distance(self, contact_dist: torch.Tensor) -> torch.Tensor:
+        gripper_width = self.gripper_width().view(-1)
+        open_error = torch.clamp(self.max_gripper_width - gripper_width, min=0.0)
+        wrist_reset = torch.as_tensor(
+            self.default_dof_pos[6], dtype=torch.float32, device=self.device
+        )
+        wrist_error = torch.abs(self.dof_pos[:, 6] - wrist_reset)
+        contact_error = torch.clamp(
+            self.desk_release_contact_threshold - contact_dist,
+            min=0.0,
+        )
+        return open_error + 0.25 * wrist_error + contact_error
+
+    def _desk_reward(self, parts_poses: torch.Tensor) -> torch.Tensor:
+        insert_rewards = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        twist_rewards = torch.zeros_like(insert_rewards)
+        contact_rewards = torch.zeros_like(insert_rewards)
+        release_rewards = torch.zeros_like(insert_rewards)
+        success_rewards = torch.zeros_like(insert_rewards)
+
+        leg_pose_mats = self._desk_leg_pose_mats(parts_poses)
+        leg_rots = leg_pose_mats[..., :3, :3]
+        inserted_now = self._desk_inserted_now(parts_poses)
+        contact_dists = self._desk_contact_distances(leg_pose_mats)
+
+        self.consecutive_assembled_steps = torch.where(
+            inserted_now,
+            self.consecutive_assembled_steps + 1,
+            torch.zeros_like(self.consecutive_assembled_steps),
+        )
+        newly_inserted = (
+            (self.consecutive_assembled_steps >= self.assembly_confirm_frames)
+            & ~self.desk_inserted_mask
+        )
+        self.desk_inserted_mask |= newly_inserted
+        insert_rewards = newly_inserted.sum(dim=1).float() * self.desk_insert_reward_value
+
+        self._desk_select_current_pairs(contact_dists)
+        env_idxs = torch.arange(self.num_envs, device=self.device)
+        pair_idxs = self.desk_current_pair_idx
+        current_contact_dist = contact_dists[env_idxs, pair_idxs]
+        current_inserted = self.desk_inserted_mask[env_idxs, pair_idxs]
+        current_success = self.desk_success_mask[env_idxs, pair_idxs]
+        current_rot = leg_rots[env_idxs, pair_idxs]
+
+        in_approach = self.desk_phase == self.desk_phase_approach
+        in_twist = self.desk_phase == self.desk_phase_twist
+        in_release = self.desk_phase == self.desk_phase_release_reset
+
+        valid_prev_contact = torch.isfinite(self.desk_prev_contact_dist)
+        contact_progress = (self.desk_prev_contact_dist - current_contact_dist) / max(
+            self.desk_contact_reward_scale, 1e-6
+        )
+        contact_rewards = torch.where(
+            in_approach & valid_prev_contact & ~current_success,
+            torch.clamp(contact_progress, -1.0, 1.0) * self.desk_contact_reward_weight,
+            contact_rewards,
+        )
+
+        gripper_width = self.gripper_width().view(-1)
+        gripper_closed = gripper_width < self.max_gripper_width * 0.45
+        grasp_ready = (current_contact_dist < self.desk_contact_threshold) & gripper_closed
+        start_twist = in_approach & current_inserted & grasp_ready & ~current_success
+        self.desk_phase = torch.where(
+            start_twist,
+            torch.full_like(self.desk_phase, self.desk_phase_twist),
+            self.desk_phase,
+        )
+        in_twist = self.desk_phase == self.desk_phase_twist
+
+        prev_valid = self.desk_prev_leg_rot_valid[env_idxs, pair_idxs]
+        prev_rot = self.desk_prev_leg_rot[env_idxs, pair_idxs]
+        rel_delta = torch.matmul(prev_rot.transpose(-1, -2), current_rot)
+        signed_delta = (
+            C.matrix_to_axis_angle(rel_delta)[..., 1] * self.desk_twist_axis_sign
+        )
+        signed_delta = torch.clamp(
+            signed_delta,
+            -self.desk_twist_delta_clip_rad,
+            self.desk_twist_delta_clip_rad,
+        )
+        track_twist = (
+            in_twist & current_inserted & grasp_ready & prev_valid & ~current_success
+        )
+        current_cumulative = self.desk_cumulative_twist[env_idxs, pair_idxs]
+        remaining_twist = torch.clamp(
+            self.desk_twist_target_rad - current_cumulative, min=0.0
+        )
+        reward_delta = torch.where(
+            signed_delta > 0.0,
+            torch.minimum(signed_delta, remaining_twist),
+            signed_delta,
+        )
+        twist_rewards = torch.where(
+            track_twist,
+            reward_delta
+            / max(self.desk_twist_target_rad, 1e-6)
+            * self.desk_twist_total_reward,
+            twist_rewards,
+        )
+        new_cumulative = torch.clamp(
+            current_cumulative
+            + torch.where(track_twist, signed_delta, torch.zeros_like(signed_delta)),
+            min=0.0,
+            max=self.desk_twist_target_rad,
+        )
+        self.desk_cumulative_twist[env_idxs, pair_idxs] = new_cumulative
+        self.desk_round_twist = torch.clamp(
+            self.desk_round_twist
+            + torch.where(track_twist, signed_delta, torch.zeros_like(signed_delta)),
+            min=0.0,
+        )
+        has_progress = track_twist & (
+            signed_delta > self.desk_twist_progress_threshold_rad
+        )
+        no_progress_now = in_twist & ~has_progress
+        self.desk_no_progress_steps = torch.where(
+            has_progress,
+            torch.zeros_like(self.desk_no_progress_steps),
+            torch.where(
+                no_progress_now,
+                self.desk_no_progress_steps + 1,
+                self.desk_no_progress_steps,
+            ),
+        )
+        contact_rewards = torch.where(
+            in_twist & grasp_ready & ~current_success,
+            contact_rewards + self.desk_contact_reward_weight * 0.05,
+            contact_rewards,
+        )
+
+        newly_success = (
+            current_inserted
+            & (new_cumulative >= self.desk_twist_target_rad)
+            & ~current_success
+        )
+        success_rewards = torch.where(
+            newly_success,
+            torch.full_like(success_rewards, self.desk_success_reward_value),
+            success_rewards,
+        )
+        self.desk_success_mask[env_idxs, pair_idxs] |= newly_success
+        self.already_assembled = self.desk_success_mask.clone()
+
+        release_trigger = (
+            in_twist
+            & ~newly_success
+            & (
+                (self.desk_round_twist >= self.desk_twist_round_rad)
+                | self._desk_wrist_near_limit()
+                | (self.desk_no_progress_steps >= self.desk_no_progress_limit)
+            )
+        )
+        self.desk_phase = torch.where(
+            release_trigger,
+            torch.full_like(self.desk_phase, self.desk_phase_release_reset),
+            self.desk_phase,
+        )
+        self.desk_round_twist = torch.where(
+            release_trigger | newly_success,
+            torch.zeros_like(self.desk_round_twist),
+            self.desk_round_twist,
+        )
+        self.desk_no_progress_steps = torch.where(
+            release_trigger | newly_success,
+            torch.zeros_like(self.desk_no_progress_steps),
+            self.desk_no_progress_steps,
+        )
+
+        release_dist = self._desk_release_distance(current_contact_dist)
+        valid_prev_release = torch.isfinite(self.desk_prev_release_dist)
+        release_progress = (
+            self.desk_prev_release_dist - release_dist
+        ) / max(self.desk_contact_reward_scale, 1e-6)
+        in_release = self.desk_phase == self.desk_phase_release_reset
+        release_rewards = torch.where(
+            in_release & valid_prev_release,
+            torch.clamp(release_progress, -1.0, 1.0) * self.desk_release_reward_weight,
+            release_rewards,
+        )
+
+        wrist_reset = torch.as_tensor(
+            self.default_dof_pos[6], dtype=torch.float32, device=self.device
+        )
+        wrist_ready = (
+            torch.abs(self.dof_pos[:, 6] - wrist_reset)
+            < self.desk_wrist_reset_threshold_rad
+        )
+        gripper_open = gripper_width > self.max_gripper_width * 0.75
+        contact_released = current_contact_dist > self.desk_release_contact_threshold
+        finish_release = in_release & gripper_open & wrist_ready & contact_released
+        self.desk_phase = torch.where(
+            finish_release | newly_success,
+            torch.full_like(self.desk_phase, self.desk_phase_approach),
+            self.desk_phase,
+        )
+
+        self.desk_prev_leg_rot[env_idxs, pair_idxs] = current_rot
+        self.desk_prev_leg_rot_valid[env_idxs, pair_idxs] = True
+        self.desk_prev_contact_dist = torch.where(
+            self.desk_phase == self.desk_phase_approach,
+            current_contact_dist,
+            torch.full_like(current_contact_dist, float("nan")),
+        )
+        self.desk_prev_release_dist = torch.where(
+            self.desk_phase == self.desk_phase_release_reset,
+            release_dist,
+            torch.full_like(release_dist, float("nan")),
+        )
+
+        self.last_insert_rewards = insert_rewards.unsqueeze(-1)
+        self.last_twist_rewards = twist_rewards.unsqueeze(-1)
+        self.last_contact_rewards = contact_rewards.unsqueeze(-1)
+        self.last_release_rewards = release_rewards.unsqueeze(-1)
+        self.last_success_rewards = success_rewards.unsqueeze(-1)
+        self.last_assembly_rewards = self.last_insert_rewards + self.last_success_rewards
+        self.last_desk_phase = self.desk_phase.unsqueeze(-1)
+        self.last_desk_contact_dist = current_contact_dist.unsqueeze(-1)
+
+        return (
+            insert_rewards
+            + twist_rewards
+            + contact_rewards
+            + release_rewards
+            + success_rewards
+        ).unsqueeze(-1)
 
     def _reset_lamp_bulb_state(self, env_idxs: torch.Tensor):
         """Keep lamp bulb rest-pose bookkeeping consistent across reset paths."""
@@ -2155,59 +2607,6 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         if isinstance(value, (np.floating, float)):
             return f"{float(value):.4f}"
         return str(value)
-
-    def _reset_desk_leg_rotation_reward(self, env_idxs: torch.Tensor):
-        if hasattr(self, "desk_leg_prev_rot_error"):
-            self.desk_leg_prev_rot_error[env_idxs] = float("nan")
-
-    def _compute_desk_leg_rotation_reward(
-        self,
-        pair_idx: int,
-        pair,
-        rel_pose: torch.Tensor,
-        similar_pos: torch.Tensor,
-    ) -> torch.Tensor:
-        if (
-            not self.desk_leg_rot_reward_enabled
-            or self.desk_leg_rot_reward_weight == 0.0
-            or pair[0] != 0
-        ):
-            return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-
-        rel_rot_to_target = torch.matmul(
-            rel_pose[..., :3, :3],
-            self.assembled_rel_poses[pair_idx, :, None, :3, :3].transpose(-1, -2),
-        )
-        rot_errors = torch.norm(C.matrix_to_axis_angle(rel_rot_to_target), dim=-1)
-        inserted_rot_errors = torch.where(
-            similar_pos,
-            rot_errors,
-            torch.full_like(rot_errors, float("inf")),
-        )
-        current_rot_error = inserted_rot_errors.min(dim=0).values
-        inserted_now = torch.isfinite(current_rot_error)
-        track_now = inserted_now & ~self.already_assembled[:, pair_idx]
-
-        prev_rot_error = self.desk_leg_prev_rot_error[:, pair_idx]
-        valid_prev = torch.isfinite(prev_rot_error)
-        rot_error_delta = prev_rot_error - current_rot_error
-        rot_error_delta = torch.clamp(
-            rot_error_delta,
-            -self.desk_leg_rot_reward_clip,
-            self.desk_leg_rot_reward_clip,
-        )
-        rot_reward = torch.where(
-            track_now & valid_prev,
-            rot_error_delta * self.desk_leg_rot_reward_weight,
-            torch.zeros_like(rot_error_delta),
-        )
-
-        self.desk_leg_prev_rot_error[:, pair_idx] = torch.where(
-            track_now,
-            current_rot_error,
-            torch.full_like(current_rot_error, float("nan")),
-        )
-        return rot_reward
 
     def _print_assembly_reward_debug(
         self,
@@ -2339,7 +2738,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
 
         self.already_assembled[env_idxs] = 0
         self.consecutive_assembled_steps[env_idxs] = 0
-        self._reset_desk_leg_rotation_reward(env_idxs)
+        self._reset_desk_reward_state(env_idxs)
         self._reset_frankas(env_idxs)
         self._reset_parts_multiple(env_idxs)
         self.env_steps[env_idxs] = 0
@@ -2374,12 +2773,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
 
     def _reward(self):
-        """Reward is 1 if two parts are newly assembled."""
+        """Compute sparse assembly rewards, with a custom staged desk reward."""
         rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
-        )
-        desk_leg_rot_rewards = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device
         )
 
         parts_poses = self.get_parts_poses(sim_coord=True)
@@ -2387,6 +2783,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         # Reshape parts_poses to (num_envs, num_parts, 7)
         num_parts = parts_poses.shape[1] // 7
         parts_poses = parts_poses.view(self.num_envs, num_parts, 7)
+
+        if self.furniture_name == "desk":
+            return self._desk_reward(parts_poses)
 
         # Compute the rewards based on the newly assembled parts
         newly_assembled_mask = torch.zeros(
@@ -2427,12 +2826,6 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
                 self.assembled_rel_poses[i, :, None, :3, 3],
                 pos_threshold,
             )
-            desk_leg_rot_rewards += self._compute_desk_leg_rotation_reward(
-                i,
-                pair,
-                rel_pose,
-                similar_pos,
-            )
             assembled_mask = similar_rot & similar_pos
             assembled_now = assembled_mask.any(dim=0)
 
@@ -2467,8 +2860,11 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         assembly_rewards = newly_assembled_mask.any(dim=1).float().unsqueeze(-1)
         rewards = assembly_rewards
         self.last_assembly_rewards = assembly_rewards
-        self.last_desk_leg_rot_rewards = desk_leg_rot_rewards.unsqueeze(-1)
-        rewards = rewards + desk_leg_rot_rewards.unsqueeze(-1)
+        self.last_insert_rewards = torch.zeros_like(rewards)
+        self.last_twist_rewards = torch.zeros_like(rewards)
+        self.last_contact_rewards = torch.zeros_like(rewards)
+        self.last_release_rewards = torch.zeros_like(rewards)
+        self.last_success_rewards = torch.zeros_like(rewards)
 
         # print(f"Already assembled: {self.already_assembled.sum(dim=1)}")
         # print(
@@ -2483,6 +2879,8 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
     def _done(self):
         if self.manual_done:
             return torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+        if self.furniture_name == "desk" and hasattr(self, "desk_success_mask"):
+            return self.desk_success_mask.all(dim=1, keepdim=True)
         return (
             self.already_assembled.sum(dim=1) == len(self.pairs_to_assemble)
         ).unsqueeze(1)
@@ -2519,7 +2917,56 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             "obs_success": True,
             "action_success": True,
             "assembly_reward": self.last_assembly_rewards.clone(),
-            "desk_leg_rot_reward": self.last_desk_leg_rot_rewards.clone(),
+            "desk_insert_reward": self.last_insert_rewards.clone(),
+            "desk_twist_reward": self.last_twist_rewards.clone(),
+            "desk_contact_reward": self.last_contact_rewards.clone(),
+            "desk_release_reward": self.last_release_rewards.clone(),
+            "desk_success_reward": self.last_success_rewards.clone(),
+            "desk_phase": self.last_desk_phase.clone(),
+            "desk_current_pair_idx": getattr(
+                self,
+                "desk_current_pair_idx",
+                torch.zeros(self.num_envs, dtype=torch.int64, device=self.device),
+            ).clone(),
+            "desk_cumulative_twist_deg": torch.rad2deg(
+                getattr(
+                    self,
+                    "desk_cumulative_twist",
+                    torch.zeros(
+                        (self.num_envs, len(self.pairs_to_assemble)),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+            ).clone(),
+            "desk_round_twist_deg": torch.rad2deg(
+                getattr(
+                    self,
+                    "desk_round_twist",
+                    torch.zeros(
+                        self.num_envs, dtype=torch.float32, device=self.device
+                    ),
+                )
+            ).clone(),
+            "desk_contact_dist": self.last_desk_contact_dist.clone(),
+            "desk_inserted_mask": getattr(
+                self,
+                "desk_inserted_mask",
+                torch.zeros(
+                    (self.num_envs, len(self.pairs_to_assemble)),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+            ).clone(),
+            "desk_success_mask": getattr(
+                self,
+                "desk_success_mask",
+                torch.zeros(
+                    (self.num_envs, len(self.pairs_to_assemble)),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+            ).clone(),
         }
 
         return (
