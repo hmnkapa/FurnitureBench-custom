@@ -499,7 +499,7 @@ def quat2mat(quaternion: torch.Tensor) -> torch.Tensor:
 
 # @torch.jit.script
 def quat2mat_batched(quaternion: torch.Tensor) -> torch.Tensor:
-    """Converts given quaternions (x, y, z, w) to rotation matrices.
+    """Converts Isaac Gym quaternions (x, y, z, w) to rotation matrices.
 
     Args:
         quaternion: (..., 4) tensor of quaternions
@@ -507,22 +507,21 @@ def quat2mat_batched(quaternion: torch.Tensor) -> torch.Tensor:
         (..., 3, 3) tensor of rotation matrices
     """
     EPS = 1e-8
-    inds = torch.tensor([3, 0, 1, 2], device=quaternion.device)
-    q = quaternion.index_select(-1, inds)
+    q = quaternion.clone()
 
     n = torch.sum(q * q, dim=-1, keepdim=True)
     q *= torch.rsqrt(torch.max(n, torch.tensor(EPS, device=q.device)))
 
-    q1, q2, q3, q0 = torch.unbind(q, dim=-1)
-    r11 = 1 - 2 * (q2 * q2 + q3 * q3)
-    r12 = 2 * (q1 * q2 - q3 * q0)
-    r13 = 2 * (q1 * q3 + q2 * q0)
-    r21 = 2 * (q1 * q2 + q3 * q0)
-    r22 = 1 - 2 * (q1 * q1 + q3 * q3)
-    r23 = 2 * (q2 * q3 - q1 * q0)
-    r31 = 2 * (q1 * q3 - q2 * q0)
-    r32 = 2 * (q2 * q3 + q1 * q0)
-    r33 = 1 - 2 * (q1 * q1 + q2 * q2)
+    qx, qy, qz, qw = torch.unbind(q, dim=-1)
+    r11 = 1 - 2 * (qy * qy + qz * qz)
+    r12 = 2 * (qx * qy - qz * qw)
+    r13 = 2 * (qx * qz + qy * qw)
+    r21 = 2 * (qx * qy + qz * qw)
+    r22 = 1 - 2 * (qx * qx + qz * qz)
+    r23 = 2 * (qy * qz - qx * qw)
+    r31 = 2 * (qx * qz - qy * qw)
+    r32 = 2 * (qy * qz + qx * qw)
+    r33 = 1 - 2 * (qx * qx + qy * qy)
 
     rot_matrix = torch.stack(
         [

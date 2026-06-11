@@ -10,7 +10,7 @@ sim_config = config.copy()
 # Positional threshold for declaring the furniture assembled.
 # This is a smaller value compared to the real-world config, since the detection can be more accurate in simulation.
 # This will reduce the false positive rate.
-sim_config["furniture"]["assembled_pos_threshold"] = [0.005, 0.005, 0.005]
+sim_config["furniture"]["assembled_pos_threshold"] = [0.01, 0.01, 0.01]
 
 
 # Timeout for # environment steps for each furniture model.

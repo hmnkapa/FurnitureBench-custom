@@ -2231,6 +2231,11 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             dtype=torch.float32,
             device=self.device,
         )
+        self.desk_fingertip_contact_offset_local = torch.tensor(
+            [0.0, 0.0, 0.04525],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
     def _reset_desk_reward_state(self, env_idxs: torch.Tensor):
         if self.furniture_name != "desk" or not hasattr(self, "desk_inserted_mask"):
@@ -2292,6 +2297,17 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
 
         return inserted_now
 
+    def _desk_fingertip_world_points(self):
+        left_states = self.rb_states[self.left_finger_idxs, :7]
+        right_states = self.rb_states[self.right_finger_idxs, :7]
+        offset = self.desk_fingertip_contact_offset_local.view(1, 3, 1)
+
+        left_rot = C.quat2mat_batched(left_states[:, 3:7])
+        right_rot = C.quat2mat_batched(right_states[:, 3:7])
+        left = left_states[:, :3] + torch.matmul(left_rot, offset).squeeze(-1)
+        right = right_states[:, :3] + torch.matmul(right_rot, offset).squeeze(-1)
+        return left, right
+
     def _desk_contact_distances(self, leg_pose_mats: torch.Tensor) -> torch.Tensor:
         leg_pos = leg_pose_mats[..., :3, 3]
         leg_rot = leg_pose_mats[..., :3, :3]
@@ -2301,8 +2317,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             + leg_pos[:, :, None, None, :]
         )
 
-        left = self.rb_states[self.left_finger_idxs, :3]
-        right = self.rb_states[self.right_finger_idxs, :3]
+        left, right = self._desk_fingertip_world_points()
         left_dist = torch.linalg.norm(
             left[:, None, None, :] - world_points[:, :, :, 0], dim=-1
         )
@@ -2346,13 +2361,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             < self.desk_wrist_limit_margin_rad
         )
 
+    def _desk_wrist_reset_error(self):
+        return torch.abs(self.dof_pos[:, 6] - 0.8)
+
     def _desk_release_distance(self, contact_dist: torch.Tensor) -> torch.Tensor:
         gripper_width = self.gripper_width().view(-1)
         open_error = torch.clamp(self.max_gripper_width - gripper_width, min=0.0)
-        wrist_reset = torch.as_tensor(
-            self.default_dof_pos[6], dtype=torch.float32, device=self.device
-        )
-        wrist_error = torch.abs(self.dof_pos[:, 6] - wrist_reset)
+        wrist_error = self._desk_wrist_reset_error()
         contact_error = torch.clamp(
             self.desk_release_contact_threshold - contact_dist,
             min=0.0,
@@ -2408,7 +2423,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
 
         gripper_width = self.gripper_width().view(-1)
-        gripper_closed = gripper_width < self.max_gripper_width * 0.45
+        gripper_closed = gripper_width < self.max_gripper_width * 0.55
         grasp_ready = (current_contact_dist < self.desk_contact_threshold) & gripper_closed
         start_twist = in_approach & current_inserted & grasp_ready & ~current_success
         self.desk_phase = torch.where(
@@ -2529,13 +2544,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             release_rewards,
         )
 
-        wrist_reset = torch.as_tensor(
-            self.default_dof_pos[6], dtype=torch.float32, device=self.device
-        )
-        wrist_ready = (
-            torch.abs(self.dof_pos[:, 6] - wrist_reset)
-            < self.desk_wrist_reset_threshold_rad
-        )
+        wrist_ready = self._desk_wrist_reset_error() < self.desk_wrist_reset_threshold_rad
         gripper_open = gripper_width > self.max_gripper_width * 0.75
         contact_released = current_contact_dist > self.desk_release_contact_threshold
         finish_release = in_release & gripper_open & wrist_ready & contact_released
