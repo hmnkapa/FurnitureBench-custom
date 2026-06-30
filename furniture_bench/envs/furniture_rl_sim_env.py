@@ -168,7 +168,7 @@ class FurnitureSimEnv(gym.Env):
         self.desk_release_contact_threshold = float(
             kwargs.get("desk_release_contact_threshold", 0.045)
         )
-        self.desk_contact_key_y = float(kwargs.get("desk_contact_key_y", 0.03375))
+        self.desk_contact_key_y = float(kwargs.get("desk_contact_key_y", 0.039375))
         self.desk_contact_surface = float(kwargs.get("desk_contact_surface", 0.0175))
         self.desk_twist_delta_clip_rad = float(
             np.deg2rad(kwargs.get("desk_twist_delta_clip_deg", 20.0))
@@ -2455,15 +2455,11 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
     def _desk_wrist_reset_error(self):
         return torch.abs(self.dof_pos[:, 6] - 0.8)
 
-    def _desk_release_distance(self, contact_dist: torch.Tensor) -> torch.Tensor:
+    def _desk_release_distance(self) -> torch.Tensor:
         gripper_width = self.gripper_width().view(-1)
         open_error = torch.clamp(self.max_gripper_width - gripper_width, min=0.0)
         wrist_error = self._desk_wrist_reset_error()
-        contact_error = torch.clamp(
-            self.desk_release_contact_threshold - contact_dist,
-            min=0.0,
-        )
-        return open_error + 0.25 * wrist_error + contact_error
+        return open_error + 0.25 * wrist_error
 
     def _desk_reward(self, parts_poses: torch.Tensor) -> torch.Tensor:
         insert_rewards = torch.zeros(
@@ -2688,7 +2684,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             self.desk_release_reward_pair_idx,
         )
 
-        release_dist = self._desk_release_distance(current_contact_dist)
+        release_dist = self._desk_release_distance()
         valid_prev_release = torch.isfinite(self.desk_prev_release_dist)
         release_progress = (
             self.desk_prev_release_dist - release_dist
@@ -2708,8 +2704,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
 
         wrist_ready = self._desk_wrist_reset_error() < self.desk_wrist_reset_threshold_rad
         gripper_open = gripper_width > self.max_gripper_width * 0.75
-        contact_released = current_contact_dist > self.desk_release_contact_threshold
-        finish_release = in_release & gripper_open & wrist_ready & contact_released
+        finish_release = in_release & gripper_open & wrist_ready
         self.desk_phase = torch.where(
             finish_release | newly_success,
             torch.full_like(self.desk_phase, self.desk_phase_approach),
