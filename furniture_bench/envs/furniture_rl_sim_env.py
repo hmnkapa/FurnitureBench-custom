@@ -149,6 +149,30 @@ class FurnitureSimEnv(gym.Env):
             kwargs.get("desk_twist_total_reward", 1.0)
         )
         self.desk_twist_axis_sign = float(kwargs.get("desk_twist_axis_sign", -1.0))
+        self.desk_top_yaw_target_rad = float(
+            np.deg2rad(kwargs.get("desk_top_yaw_target_deg", 180.0))
+        )
+        desk_top_yaw_total_reward = kwargs.get("desk_top_yaw_total_reward", None)
+        self.desk_top_yaw_total_reward = float(
+            self.desk_twist_total_reward
+            if desk_top_yaw_total_reward is None
+            else desk_top_yaw_total_reward
+        )
+        desk_top_yaw_bonus_reward = kwargs.get("desk_top_yaw_bonus_reward", None)
+        self.desk_top_yaw_bonus_reward = float(
+            self.desk_success_reward_value
+            if desk_top_yaw_bonus_reward is None
+            else desk_top_yaw_bonus_reward
+        )
+        self.desk_top_yaw_success_tolerance_rad = float(
+            np.deg2rad(kwargs.get("desk_top_yaw_success_tolerance_deg", 10.0))
+        )
+        self.desk_top_max_tilt_rad = float(
+            np.deg2rad(kwargs.get("desk_top_max_tilt_deg", 15.0))
+        )
+        self.desk_top_yaw_delta_clip_rad = float(
+            np.deg2rad(kwargs.get("desk_top_yaw_delta_clip_deg", 20.0))
+        )
         self.desk_contact_reward_weight = float(
             kwargs.get("desk_contact_reward_weight", 0.15)
         )
@@ -2176,6 +2200,15 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_success_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
+        self.last_top_yaw_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_top_yaw_bonus_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
+        self.last_desk_top_yaw_progress = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
         self.last_desk_phase = torch.zeros(
             (self.num_envs, 1), dtype=torch.int64, device=self.device
         )
@@ -2198,7 +2231,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.desk_phase_approach = 0
         self.desk_phase_twist = 1
         self.desk_phase_release_reset = 2
+        self.desk_phase_top_yaw = 3
         num_pairs = len(self.pairs_to_assemble)
+        self.desk_top_yaw_unlock_pair_count = min(2, num_pairs)
 
         self.desk_inserted_mask = torch.zeros(
             (self.num_envs, num_pairs), dtype=torch.bool, device=self.device
@@ -2226,6 +2261,18 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         self.desk_round_twist = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.desk_top_yaw_baseline_rot = torch.eye(
+            3, dtype=torch.float32, device=self.device
+        ).repeat(self.num_envs, 1, 1)
+        self.desk_top_yaw_baseline_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.desk_top_yaw_max_progress = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.desk_top_yaw_complete = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
         self.desk_no_progress_steps = torch.zeros(
             self.num_envs, dtype=torch.int32, device=self.device
@@ -2279,6 +2326,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
                 [(0, 1), (0, 2), (0, 3), (0, 4)],
             )
         )
+        # Keep the model-visible task state shape compatible with old checkpoints:
         # phase one-hot, current pair one-hot, inserted mask, success mask,
         # per-pair cumulative twist progress, and current regrasp-round progress.
         return 3 + num_pairs * 4 + 1
@@ -2309,7 +2357,6 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             0.0,
             1.0,
         )
-
         return torch.cat(
             [
                 phase_one_hot,
@@ -2339,6 +2386,12 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.desk_prev_leg_rot_valid[env_idxs] = False
         self.desk_cumulative_twist[env_idxs] = 0.0
         self.desk_round_twist[env_idxs] = 0.0
+        self.desk_top_yaw_baseline_rot[env_idxs] = torch.eye(
+            3, dtype=torch.float32, device=self.device
+        )
+        self.desk_top_yaw_baseline_valid[env_idxs] = False
+        self.desk_top_yaw_max_progress[env_idxs] = 0.0
+        self.desk_top_yaw_complete[env_idxs] = False
         self.desk_no_progress_steps[env_idxs] = 0
         self.desk_contact_reward_counts[env_idxs] = 0
         self.desk_release_reward_counts[env_idxs] = 0
@@ -2353,6 +2406,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_contact_rewards[env_idxs] = 0.0
         self.last_release_rewards[env_idxs] = 0.0
         self.last_success_rewards[env_idxs] = 0.0
+        self.last_top_yaw_rewards[env_idxs] = 0.0
+        self.last_top_yaw_bonus_rewards[env_idxs] = 0.0
+        self.last_desk_top_yaw_progress[env_idxs] = 0.0
         self.last_desk_phase[env_idxs] = self.desk_phase_approach
         self.last_desk_contact_dist[env_idxs] = float("inf")
         self.last_assembly_rewards[env_idxs] = 0.0
@@ -2362,6 +2418,32 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         for _, leg_idx in self.pairs_to_assemble:
             leg_pose_mats.append(C.pose_from_vector(parts_poses[:, leg_idx]))
         return torch.stack(leg_pose_mats, dim=1)
+
+    def _desk_top_pose_mat(self, parts_poses: torch.Tensor):
+        return C.pose_from_vector(parts_poses[:, 0])
+
+    def _desk_top_yaw_unlocked(self) -> torch.Tensor:
+        required_insert_count = self.desk_top_yaw_unlock_pair_count
+        if required_insert_count == 0:
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        return self.desk_inserted_mask.sum(dim=1) >= required_insert_count
+
+    def _desk_top_yaw_from_baseline(self, top_rot: torch.Tensor) -> torch.Tensor:
+        baseline_rot = self.desk_top_yaw_baseline_rot
+        baseline_xy = baseline_rot[:, :2, :]
+        current_xy = top_rot[:, :2, :]
+        dot = (baseline_xy * current_xy).sum(dim=(1, 2))
+        cross = (
+            baseline_xy[:, 0, :] * current_xy[:, 1, :]
+            - baseline_xy[:, 1, :] * current_xy[:, 0, :]
+        ).sum(dim=1)
+        signed_yaw = torch.atan2(cross, dot)
+        return torch.clamp(torch.abs(signed_yaw), max=self.desk_top_yaw_target_rad)
+
+    def _desk_top_tilt(self, top_rot: torch.Tensor) -> torch.Tensor:
+        vertical_alignment = torch.abs(top_rot[:, 2, :]).max(dim=1).values
+        vertical_alignment = torch.clamp(vertical_alignment, 0.0, 1.0)
+        return torch.acos(vertical_alignment)
 
     def _desk_inserted_now(self, parts_poses: torch.Tensor) -> torch.Tensor:
         inserted_now = torch.zeros(
@@ -2469,9 +2551,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         contact_rewards = torch.zeros_like(insert_rewards)
         release_rewards = torch.zeros_like(insert_rewards)
         success_rewards = torch.zeros_like(insert_rewards)
+        top_yaw_rewards = torch.zeros_like(insert_rewards)
+        top_yaw_bonus_rewards = torch.zeros_like(insert_rewards)
 
         leg_pose_mats = self._desk_leg_pose_mats(parts_poses)
         leg_rots = leg_pose_mats[..., :3, :3]
+        top_pose_mat = self._desk_top_pose_mat(parts_poses)
+        top_rot = top_pose_mat[..., :3, :3]
         inserted_now = self._desk_inserted_now(parts_poses)
         contact_dists = self._desk_contact_distances(leg_pose_mats)
 
@@ -2721,6 +2807,88 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             torch.zeros_like(self.desk_release_reward_active),
         )
 
+        top_yaw_unlocked = self._desk_top_yaw_unlocked()
+        enter_top_yaw = (
+            top_yaw_unlocked
+            & ~self.desk_top_yaw_complete
+            & ~self.desk_top_yaw_baseline_valid
+        )
+        self.desk_top_yaw_baseline_rot = torch.where(
+            enter_top_yaw.view(-1, 1, 1),
+            top_rot,
+            self.desk_top_yaw_baseline_rot,
+        )
+        self.desk_top_yaw_baseline_valid |= enter_top_yaw
+        self.desk_phase = torch.where(
+            enter_top_yaw,
+            torch.full_like(self.desk_phase, self.desk_phase_top_yaw),
+            self.desk_phase,
+        )
+
+        top_yaw_progress = torch.where(
+            self.desk_top_yaw_baseline_valid,
+            self._desk_top_yaw_from_baseline(top_rot),
+            torch.zeros_like(self.desk_top_yaw_max_progress),
+        )
+        top_yaw_progress_delta = torch.clamp(
+            top_yaw_progress - self.desk_top_yaw_max_progress,
+            min=0.0,
+            max=self.desk_top_yaw_delta_clip_rad,
+        )
+        in_top_yaw = self.desk_phase == self.desk_phase_top_yaw
+        track_top_yaw = (
+            in_top_yaw
+            & self.desk_top_yaw_baseline_valid
+            & ~self.desk_top_yaw_complete
+        )
+        top_yaw_rewards = torch.where(
+            track_top_yaw,
+            top_yaw_progress_delta
+            / max(self.desk_top_yaw_target_rad, 1e-6)
+            * self.desk_top_yaw_total_reward,
+            top_yaw_rewards,
+        )
+        self.desk_top_yaw_max_progress = torch.where(
+            track_top_yaw,
+            torch.maximum(self.desk_top_yaw_max_progress, top_yaw_progress),
+            self.desk_top_yaw_max_progress,
+        )
+
+        required_insert_count = self.desk_top_yaw_unlock_pair_count
+        enough_legs_inserted_now = inserted_now.sum(dim=1) >= required_insert_count
+        top_yaw_near_target = (
+            torch.abs(self.desk_top_yaw_target_rad - top_yaw_progress)
+            <= self.desk_top_yaw_success_tolerance_rad
+        )
+        top_tilt_ok = self._desk_top_tilt(top_rot) <= self.desk_top_max_tilt_rad
+        newly_top_yaw_complete = (
+            track_top_yaw
+            & top_yaw_near_target
+            & top_tilt_ok
+            & enough_legs_inserted_now
+        )
+        top_yaw_bonus_rewards = torch.where(
+            newly_top_yaw_complete,
+            torch.full_like(top_yaw_bonus_rewards, self.desk_top_yaw_bonus_reward),
+            top_yaw_bonus_rewards,
+        )
+        self.desk_top_yaw_complete |= newly_top_yaw_complete
+        self.desk_phase = torch.where(
+            newly_top_yaw_complete,
+            torch.full_like(self.desk_phase, self.desk_phase_approach),
+            self.desk_phase,
+        )
+        self.desk_contact_reward_active = torch.where(
+            in_top_yaw | newly_top_yaw_complete,
+            torch.zeros_like(self.desk_contact_reward_active),
+            self.desk_contact_reward_active,
+        )
+        self.desk_release_reward_active = torch.where(
+            in_top_yaw | newly_top_yaw_complete,
+            torch.zeros_like(self.desk_release_reward_active),
+            self.desk_release_reward_active,
+        )
+
         self.desk_prev_leg_rot[env_idxs, pair_idxs] = current_rot
         self.desk_prev_leg_rot_valid[env_idxs, pair_idxs] = True
         self.desk_prev_contact_dist = torch.where(
@@ -2739,6 +2907,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_contact_rewards = contact_rewards.unsqueeze(-1)
         self.last_release_rewards = release_rewards.unsqueeze(-1)
         self.last_success_rewards = success_rewards.unsqueeze(-1)
+        self.last_top_yaw_rewards = top_yaw_rewards.unsqueeze(-1)
+        self.last_top_yaw_bonus_rewards = top_yaw_bonus_rewards.unsqueeze(-1)
+        self.last_desk_top_yaw_progress = top_yaw_progress.unsqueeze(-1)
         self.last_assembly_rewards = self.last_insert_rewards + self.last_success_rewards
         self.last_desk_phase = self.desk_phase.unsqueeze(-1)
         self.last_desk_contact_dist = current_contact_dist.unsqueeze(-1)
@@ -2749,6 +2920,8 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             + contact_rewards
             + release_rewards
             + success_rewards
+            + top_yaw_rewards
+            + top_yaw_bonus_rewards
         ).unsqueeze(-1)
 
     def _reset_lamp_bulb_state(self, env_idxs: torch.Tensor):
@@ -3041,6 +3214,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_contact_rewards = torch.zeros_like(rewards)
         self.last_release_rewards = torch.zeros_like(rewards)
         self.last_success_rewards = torch.zeros_like(rewards)
+        self.last_top_yaw_rewards = torch.zeros_like(rewards)
+        self.last_top_yaw_bonus_rewards = torch.zeros_like(rewards)
+        self.last_desk_top_yaw_progress = torch.zeros_like(rewards)
 
         # print(f"Already assembled: {self.already_assembled.sum(dim=1)}")
         # print(
@@ -3056,7 +3232,10 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         if self.manual_done:
             return torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
         if self.furniture_name == "desk" and hasattr(self, "desk_success_mask"):
-            return self.desk_success_mask.all(dim=1, keepdim=True)
+            return (
+                self.desk_success_mask.all(dim=1)
+                & self.desk_top_yaw_complete
+            ).unsqueeze(1)
         return (
             self.already_assembled.sum(dim=1) == len(self.pairs_to_assemble)
         ).unsqueeze(1)
@@ -3100,6 +3279,8 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             "desk_contact_reward": self.last_contact_rewards.clone(),
             "desk_release_reward": self.last_release_rewards.clone(),
             "desk_success_reward": self.last_success_rewards.clone(),
+            "desk_top_yaw_reward": self.last_top_yaw_rewards.clone(),
+            "desk_top_yaw_bonus": self.last_top_yaw_bonus_rewards.clone(),
             "desk_phase": self.last_desk_phase.clone(),
             "desk_current_pair_idx": getattr(
                 self,
@@ -3126,6 +3307,24 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
                     ),
                 )
             ).clone(),
+            "desk_top_yaw_progress_deg": torch.rad2deg(
+                getattr(
+                    self,
+                    "last_desk_top_yaw_progress",
+                    torch.zeros(
+                        (self.num_envs, 1),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+            ).clone(),
+            "desk_top_yaw_complete": getattr(
+                self,
+                "desk_top_yaw_complete",
+                torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            )
+            .view(-1, 1)
+            .clone(),
             "desk_contact_dist": self.last_desk_contact_dist.clone(),
             "desk_inserted_mask": getattr(
                 self,
