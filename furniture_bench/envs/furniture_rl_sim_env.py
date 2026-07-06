@@ -179,6 +179,9 @@ class FurnitureSimEnv(gym.Env):
         self.desk_release_reward_weight = float(
             kwargs.get("desk_release_reward_weight", 0.10)
         )
+        self.desk_proximity_reward_weight = float(
+            kwargs.get("desk_proximity_reward_weight", 0.10)
+        )
         self.desk_contact_reward_max_attempts = int(
             kwargs.get("desk_contact_reward_max_attempts", 5)
         )
@@ -187,6 +190,9 @@ class FurnitureSimEnv(gym.Env):
         )
         self.desk_contact_reward_scale = float(
             kwargs.get("desk_contact_reward_scale", 0.02)
+        )
+        self.desk_proximity_reward_scale = float(
+            kwargs.get("desk_proximity_reward_scale", 0.02)
         )
         self.desk_contact_threshold = float(kwargs.get("desk_contact_threshold", 0.035))
         self.desk_release_contact_threshold = float(
@@ -1622,23 +1628,21 @@ class FurnitureSimEnv(gym.Env):
             )
         self.move_neutral = False
 
-    def reset_to(self, state):
+    def reset_to(self, state, desk_initial_phase=None):
         """Reset to a specific state.
 
         Args:
             state: List of observation dictionary for each environment.
         """
+        if len(state) != self.num_envs:
+            raise ValueError(
+                f"reset_to expected {self.num_envs} states, got {len(state)}"
+            )
+
         for i in range(self.num_envs):
             self.reset_env_to(i, state[i])
 
-        if (
-            hasattr(self, "already_assembled")
-            or hasattr(self, "consecutive_assembled_steps")
-            or getattr(self, "furniture_name", None) == "lamp"
-        ):
-            env_idxs = torch.arange(
-                self.num_envs, device=self.device, dtype=torch.int32
-            )
+        env_idxs = torch.arange(self.num_envs, device=self.device, dtype=torch.int32)
 
         if hasattr(self, "already_assembled"):
             self.already_assembled[env_idxs] = 0
@@ -1651,6 +1655,134 @@ class FurnitureSimEnv(gym.Env):
             self, "_reset_lamp_bulb_state"
         ):
             self._reset_lamp_bulb_state(env_idxs)
+
+        self.refresh()
+
+        if (
+            getattr(self, "furniture_name", None) == "desk"
+            and desk_initial_phase is not None
+        ):
+            self._restore_desk_initial_state_from_metadata(
+                state, env_idxs, desk_initial_phase
+            )
+
+        obs = self.get_observation()
+        if self.furniture_name == "desk" and hasattr(self, "desk_phase"):
+            obs["task_state"] = self._desk_task_state_obs()
+        return obs
+
+    def _restore_desk_initial_state_from_metadata(
+        self, states, env_idxs: torch.Tensor, desk_initial_phase: str
+    ):
+        if desk_initial_phase not in ("top_yaw", "top_yaw_complete"):
+            raise ValueError(
+                f"Unsupported desk_initial_phase={desk_initial_phase!r}; "
+                "expected 'top_yaw' or 'top_yaw_complete'."
+            )
+
+        metadata = []
+        for env_idx, state in enumerate(states):
+            meta = state.get("metadata") if isinstance(state, dict) else None
+            if not isinstance(meta, dict):
+                raise ValueError(
+                    f"Desk initial state for env {env_idx} is missing metadata"
+                )
+            metadata.append(meta)
+
+        inserted_mask = torch.tensor(
+            [meta["desk_inserted_mask"] for meta in metadata],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        success_mask = torch.tensor(
+            [meta["desk_success_mask"] for meta in metadata],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        current_pair_idx = torch.tensor(
+            [int(meta["desk_current_pair_idx"]) for meta in metadata],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        expected_shape = self.desk_inserted_mask[env_idxs.long()].shape
+        if inserted_mask.shape != expected_shape or success_mask.shape != expected_shape:
+            raise ValueError(
+                "Desk initial-state metadata masks must have shape "
+                f"{tuple(expected_shape)}, got inserted={tuple(inserted_mask.shape)} "
+                f"success={tuple(success_mask.shape)}"
+            )
+
+        env_idxs_long = env_idxs.to(device=self.device, dtype=torch.long)
+        self.desk_inserted_mask[env_idxs_long] = inserted_mask
+        self.desk_success_mask[env_idxs_long] = success_mask
+        self.already_assembled[env_idxs_long] = success_mask
+        self.consecutive_assembled_steps[env_idxs_long] = (
+            inserted_mask.to(dtype=self.consecutive_assembled_steps.dtype)
+            * self.assembly_confirm_frames
+        )
+        self.desk_current_pair_idx[env_idxs_long] = current_pair_idx
+
+        twist_target = torch.full(
+            (env_idxs_long.numel(), len(self.pairs_to_assemble)),
+            self.desk_twist_target_rad,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.desk_cumulative_twist[env_idxs_long] = torch.where(
+            success_mask,
+            twist_target,
+            torch.zeros_like(twist_target),
+        )
+        self.desk_round_twist[env_idxs_long] = 0.0
+        self.desk_no_progress_steps[env_idxs_long] = 0
+        self.desk_contact_reward_active[env_idxs_long] = False
+        self.desk_release_reward_active[env_idxs_long] = False
+        self.desk_prev_proximity_dist[env_idxs_long] = float("nan")
+        self.desk_prev_proximity_pair_idx[env_idxs_long] = current_pair_idx
+
+        parts_poses = self.get_parts_poses(sim_coord=True).view(
+            self.num_envs, -1, 7
+        )
+        leg_pose_mats = self._desk_leg_pose_mats(parts_poses)
+        leg_rots = leg_pose_mats[..., :3, :3]
+        top_rot = self._desk_top_pose_mat(parts_poses)[..., :3, :3]
+        top_yaw_complete = desk_initial_phase == "top_yaw_complete"
+        initial_phase = (
+            self.desk_phase_approach
+            if top_yaw_complete
+            else self.desk_phase_top_yaw
+        )
+
+        self.desk_prev_leg_rot[env_idxs_long] = leg_rots[env_idxs_long]
+        self.desk_prev_leg_rot_valid[env_idxs_long] = inserted_mask
+        self.desk_phase[env_idxs_long] = initial_phase
+        self.desk_top_yaw_baseline_rot[env_idxs_long] = top_rot[env_idxs_long]
+        self.desk_top_yaw_baseline_valid[env_idxs_long] = True
+        self.desk_top_yaw_max_progress[env_idxs_long] = (
+            self.desk_top_yaw_target_rad if top_yaw_complete else 0.0
+        )
+        self.desk_top_yaw_complete[env_idxs_long] = top_yaw_complete
+
+        if top_yaw_complete:
+            contact_dists = self._desk_contact_distances(leg_pose_mats)
+            self._desk_select_current_pairs(contact_dists)
+
+        self.last_insert_rewards[env_idxs_long] = 0.0
+        self.last_twist_rewards[env_idxs_long] = 0.0
+        self.last_contact_rewards[env_idxs_long] = 0.0
+        self.last_proximity_rewards[env_idxs_long] = 0.0
+        self.last_release_rewards[env_idxs_long] = 0.0
+        self.last_success_rewards[env_idxs_long] = 0.0
+        self.last_top_yaw_rewards[env_idxs_long] = 0.0
+        self.last_top_yaw_bonus_rewards[env_idxs_long] = 0.0
+        self.last_desk_top_yaw_progress[env_idxs_long] = (
+            self.desk_top_yaw_target_rad if top_yaw_complete else 0.0
+        )
+        self.last_desk_phase[env_idxs_long] = initial_phase
+        self.last_desk_contact_dist[env_idxs_long] = float("inf")
+        self.last_desk_proximity_dist[env_idxs_long] = float("inf")
+        self.last_assembly_rewards[env_idxs_long] = 0.0
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1798,14 +1930,24 @@ class FurnitureSimEnv(gym.Env):
         obstacle_right_offset = gymapi.Vec3(-0.075, -0.175, 0)
         obstacle_left_offset = gymapi.Vec3(-0.075, 0.175, 0)
 
-        # Write the obstacle poses to the root_pos and root_quat tensors
-        self.root_pos[env_idx, self.part_idxs["obstacle_front"]] = torch.tensor(
-            [obstacle_pose.p.x, obstacle_pose.p.y, obstacle_pose.p.z],
+        obstacle_front_idx, obstacle_right_idx, obstacle_left_idx = self.obstacle_handles
+        obstacle_quat = torch.tensor(
+            [obstacle_pose.r.x, obstacle_pose.r.y, obstacle_pose.r.z, obstacle_pose.r.w],
             device=self.device,
             dtype=torch.float32,
         )
 
-        self.root_pos[env_idx, self.part_idxs["obstacle_right"]] = torch.tensor(
+        # Write the obstacle poses to the root_pos and root_quat tensors.
+        # root_pos/root_quat are viewed as [env, actor-within-env, state], so use
+        # env-local actor handles here rather than global rigid-body indices.
+        self.root_pos[env_idx, obstacle_front_idx] = torch.tensor(
+            [obstacle_pose.p.x, obstacle_pose.p.y, obstacle_pose.p.z],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.root_quat[env_idx, obstacle_front_idx] = obstacle_quat
+
+        self.root_pos[env_idx, obstacle_right_idx] = torch.tensor(
             [
                 obstacle_pose.p.x + obstacle_right_offset.x,
                 obstacle_pose.p.y + obstacle_right_offset.y,
@@ -1814,8 +1956,9 @@ class FurnitureSimEnv(gym.Env):
             device=self.device,
             dtype=torch.float32,
         )
+        self.root_quat[env_idx, obstacle_right_idx] = obstacle_quat
 
-        self.root_pos[env_idx, self.part_idxs["obstacle_left"]] = torch.tensor(
+        self.root_pos[env_idx, obstacle_left_idx] = torch.tensor(
             [
                 obstacle_pose.p.x + obstacle_left_offset.x,
                 obstacle_pose.p.y + obstacle_left_offset.y,
@@ -1824,6 +1967,7 @@ class FurnitureSimEnv(gym.Env):
             device=self.device,
             dtype=torch.float32,
         )
+        self.root_quat[env_idx, obstacle_left_idx] = obstacle_quat
 
         if skip_set_state:
             return
@@ -2194,6 +2338,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_contact_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
+        self.last_proximity_rewards = torch.zeros(
+            (self.num_envs, 1), dtype=torch.float32, device=self.device
+        )
         self.last_release_rewards = torch.zeros(
             (self.num_envs, 1), dtype=torch.float32, device=self.device
         )
@@ -2213,6 +2360,9 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             (self.num_envs, 1), dtype=torch.int64, device=self.device
         )
         self.last_desk_contact_dist = torch.full(
+            (self.num_envs, 1), float("inf"), dtype=torch.float32, device=self.device
+        )
+        self.last_desk_proximity_dist = torch.full(
             (self.num_envs, 1), float("inf"), dtype=torch.float32, device=self.device
         )
         self.last_assembly_rewards = torch.zeros(
@@ -2297,6 +2447,12 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         self.desk_prev_contact_dist = torch.full(
             (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
+        )
+        self.desk_prev_proximity_dist = torch.full(
+            (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
+        )
+        self.desk_prev_proximity_pair_idx = torch.zeros(
+            self.num_envs, dtype=torch.int64, device=self.device
         )
         self.desk_prev_release_dist = torch.full(
             (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
@@ -2400,10 +2556,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.desk_contact_reward_pair_idx[env_idxs] = 0
         self.desk_release_reward_pair_idx[env_idxs] = 0
         self.desk_prev_contact_dist[env_idxs] = float("nan")
+        self.desk_prev_proximity_dist[env_idxs] = float("nan")
+        self.desk_prev_proximity_pair_idx[env_idxs] = 0
         self.desk_prev_release_dist[env_idxs] = float("nan")
         self.last_insert_rewards[env_idxs] = 0.0
         self.last_twist_rewards[env_idxs] = 0.0
         self.last_contact_rewards[env_idxs] = 0.0
+        self.last_proximity_rewards[env_idxs] = 0.0
         self.last_release_rewards[env_idxs] = 0.0
         self.last_success_rewards[env_idxs] = 0.0
         self.last_top_yaw_rewards[env_idxs] = 0.0
@@ -2411,6 +2570,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_desk_top_yaw_progress[env_idxs] = 0.0
         self.last_desk_phase[env_idxs] = self.desk_phase_approach
         self.last_desk_contact_dist[env_idxs] = float("inf")
+        self.last_desk_proximity_dist[env_idxs] = float("inf")
         self.last_assembly_rewards[env_idxs] = 0.0
 
     def _desk_leg_pose_mats(self, parts_poses: torch.Tensor):
@@ -2469,6 +2629,24 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             inserted_now[:, i] = similar_pos.any(dim=0)
 
         return inserted_now
+
+    def _desk_leg_hole_distances(self, parts_poses: torch.Tensor) -> torch.Tensor:
+        top_pose = self._desk_top_pose_mat(parts_poses)
+        top_pose_inv = torch.inverse(top_pose)
+        hole_dists = []
+
+        for i, pair in enumerate(self.pairs_to_assemble):
+            leg_pose = C.pose_from_vector(parts_poses[:, pair[1]])
+            rel_pose = torch.matmul(top_pose_inv, leg_pose)
+            rel_pos = rel_pose[..., :3, 3]
+            target_pos = self.assembled_rel_poses[i, :, :3, 3]
+            target_dists = torch.linalg.norm(
+                rel_pos[:, None, :] - target_pos[None, :, :],
+                dim=-1,
+            )
+            hole_dists.append(target_dists.min(dim=1).values)
+
+        return torch.stack(hole_dists, dim=1)
 
     def _desk_fingertip_world_points(self):
         left_states = self.rb_states[self.left_finger_idxs, :7]
@@ -2549,6 +2727,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         twist_rewards = torch.zeros_like(insert_rewards)
         contact_rewards = torch.zeros_like(insert_rewards)
+        proximity_rewards = torch.zeros_like(insert_rewards)
         release_rewards = torch.zeros_like(insert_rewards)
         success_rewards = torch.zeros_like(insert_rewards)
         top_yaw_rewards = torch.zeros_like(insert_rewards)
@@ -2560,6 +2739,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         top_rot = top_pose_mat[..., :3, :3]
         inserted_now = self._desk_inserted_now(parts_poses)
         contact_dists = self._desk_contact_distances(leg_pose_mats)
+        proximity_dists = self._desk_leg_hole_distances(parts_poses)
 
         self.consecutive_assembled_steps = torch.where(
             inserted_now,
@@ -2577,6 +2757,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         env_idxs = torch.arange(self.num_envs, device=self.device)
         pair_idxs = self.desk_current_pair_idx
         current_contact_dist = contact_dists[env_idxs, pair_idxs]
+        current_proximity_dist = proximity_dists[env_idxs, pair_idxs]
         current_inserted = self.desk_inserted_mask[env_idxs, pair_idxs]
         current_success = self.desk_success_mask[env_idxs, pair_idxs]
         current_rot = leg_rots[env_idxs, pair_idxs]
@@ -2586,23 +2767,39 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         in_release = self.desk_phase == self.desk_phase_release_reset
 
         valid_prev_contact = torch.isfinite(self.desk_prev_contact_dist)
+        valid_prev_proximity = (
+            torch.isfinite(self.desk_prev_proximity_dist)
+            & (self.desk_prev_proximity_pair_idx == pair_idxs)
+        )
         gripper_width = self.gripper_width().view(-1)
         gripper_closed = gripper_width < self.max_gripper_width * 0.55
         grasp_ready = (current_contact_dist < self.desk_contact_threshold) & gripper_closed
+
+        proximity_progress = (
+            self.desk_prev_proximity_dist - current_proximity_dist
+        ) / max(self.desk_proximity_reward_scale, 1e-6)
+        proximity_reward_allowed = (
+            in_approach & valid_prev_proximity & ~current_inserted & ~current_success
+        )
+        proximity_rewards = torch.where(
+            proximity_reward_allowed,
+            torch.clamp(proximity_progress, -1.0, 1.0)
+            * self.desk_proximity_reward_weight,
+            proximity_rewards,
+        )
 
         contact_pair_changed = (
             self.desk_contact_reward_active
             & (self.desk_contact_reward_pair_idx != pair_idxs)
         )
         self.desk_contact_reward_active = torch.where(
-            contact_pair_changed | current_success | ~current_inserted,
+            contact_pair_changed | current_success,
             torch.zeros_like(self.desk_contact_reward_active),
             self.desk_contact_reward_active,
         )
         contact_counts = self.desk_contact_reward_counts[env_idxs, pair_idxs]
         start_contact_reward_process = (
             in_approach
-            & current_inserted
             & ~current_success
             & ~self.desk_contact_reward_active
             & (contact_counts < self.desk_contact_reward_max_attempts)
@@ -2623,14 +2820,19 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         )
         contact_reward_allowed = (
             self.desk_contact_reward_active
-            & current_inserted
+            & ~current_success
             & (self.desk_contact_reward_pair_idx == pair_idxs)
+        )
+        pre_insert_contact_reward_allowed = (
+            in_approach & ~current_inserted & ~current_success
         )
         contact_progress = (self.desk_prev_contact_dist - current_contact_dist) / max(
             self.desk_contact_reward_scale, 1e-6
         )
         contact_rewards = torch.where(
-            in_approach & valid_prev_contact & contact_reward_allowed,
+            in_approach
+            & valid_prev_contact
+            & (contact_reward_allowed | pre_insert_contact_reward_allowed),
             torch.clamp(contact_progress, -1.0, 1.0) * self.desk_contact_reward_weight,
             contact_rewards,
         )
@@ -2896,6 +3098,17 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             current_contact_dist,
             torch.full_like(current_contact_dist, float("nan")),
         )
+        track_proximity_baseline = (
+            (self.desk_phase == self.desk_phase_approach)
+            & ~current_inserted
+            & ~current_success
+        )
+        self.desk_prev_proximity_dist = torch.where(
+            track_proximity_baseline,
+            current_proximity_dist,
+            torch.full_like(current_proximity_dist, float("nan")),
+        )
+        self.desk_prev_proximity_pair_idx = pair_idxs
         self.desk_prev_release_dist = torch.where(
             self.desk_phase == self.desk_phase_release_reset,
             release_dist,
@@ -2905,6 +3118,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_insert_rewards = insert_rewards.unsqueeze(-1)
         self.last_twist_rewards = twist_rewards.unsqueeze(-1)
         self.last_contact_rewards = contact_rewards.unsqueeze(-1)
+        self.last_proximity_rewards = proximity_rewards.unsqueeze(-1)
         self.last_release_rewards = release_rewards.unsqueeze(-1)
         self.last_success_rewards = success_rewards.unsqueeze(-1)
         self.last_top_yaw_rewards = top_yaw_rewards.unsqueeze(-1)
@@ -2913,11 +3127,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_assembly_rewards = self.last_insert_rewards + self.last_success_rewards
         self.last_desk_phase = self.desk_phase.unsqueeze(-1)
         self.last_desk_contact_dist = current_contact_dist.unsqueeze(-1)
+        self.last_desk_proximity_dist = current_proximity_dist.unsqueeze(-1)
 
         return (
             insert_rewards
             + twist_rewards
             + contact_rewards
+            + proximity_rewards
             + release_rewards
             + success_rewards
             + top_yaw_rewards
@@ -3212,11 +3428,13 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
         self.last_insert_rewards = torch.zeros_like(rewards)
         self.last_twist_rewards = torch.zeros_like(rewards)
         self.last_contact_rewards = torch.zeros_like(rewards)
+        self.last_proximity_rewards = torch.zeros_like(rewards)
         self.last_release_rewards = torch.zeros_like(rewards)
         self.last_success_rewards = torch.zeros_like(rewards)
         self.last_top_yaw_rewards = torch.zeros_like(rewards)
         self.last_top_yaw_bonus_rewards = torch.zeros_like(rewards)
         self.last_desk_top_yaw_progress = torch.zeros_like(rewards)
+        self.last_desk_proximity_dist = torch.full_like(rewards, float("inf"))
 
         # print(f"Already assembled: {self.already_assembled.sum(dim=1)}")
         # print(
@@ -3277,6 +3495,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             "desk_insert_reward": self.last_insert_rewards.clone(),
             "desk_twist_reward": self.last_twist_rewards.clone(),
             "desk_contact_reward": self.last_contact_rewards.clone(),
+            "desk_proximity_reward": self.last_proximity_rewards.clone(),
             "desk_release_reward": self.last_release_rewards.clone(),
             "desk_success_reward": self.last_success_rewards.clone(),
             "desk_top_yaw_reward": self.last_top_yaw_rewards.clone(),
@@ -3326,6 +3545,7 @@ class FurnitureRLSimEnv(FurnitureSimEnv):
             .view(-1, 1)
             .clone(),
             "desk_contact_dist": self.last_desk_contact_dist.clone(),
+            "desk_proximity_dist": self.last_desk_proximity_dist.clone(),
             "desk_inserted_mask": getattr(
                 self,
                 "desk_inserted_mask",
